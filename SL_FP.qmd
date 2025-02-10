@@ -1,0 +1,830 @@
+---
+title: "Statistical Learning - Final Project"
+editor: visual
+format:
+  html:
+    embed-resources: true
+---
+
+```{r setup, echo = FALSE}
+knitr::opts_chunk$set(error = TRUE)
+```
+
+As dataset I have chosen "Apple Quality" with the following variables:
+
+-   **A_id**: *Unique identifier for each fruit*
+
+-   **Size**: *Size of the fruit*
+
+-   **Weight**: *Weight of the fruit*
+
+-   **Sweetness**: *Degree of sweetness of the fruit*
+
+-   **Crunchiness**: *Texture indicating the crunchiness of the fruit*
+
+-   **Juiciness**: *Level of juiciness of the fruit*
+
+-   **Ripeness**: *Stage of ripeness of the fruit*
+
+-   **Acidity**: *Acidity level of the fruit*
+
+-   **Quality**: *Overall quality of the fruit*
+
+```{r}
+# Import necessary libraries
+library(torch)
+library(luz)
+library(tidyverse)
+library(reshape2)
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(class)
+library(pROC)  
+
+# Load the data
+data = read.csv("apple_quality.csv")
+```
+
+## Preprocessing
+
+As described in the Data Card on Kaggle, the data has already been scaled and cleaned. However, a few preprocessing steps remain. In the code chunk, NA values were removed, the target variable was encoded and converted, and duplicated rows were detected.
+
+```{r}
+set.seed(1)
+# Check for total amout of NA
+na_counts <- colSums(is.na(data))
+print(na_counts)
+data <- na.omit(data) # Only one row contains NA, therefore drop
+
+# Encode "bad" = 0 and "good" = 1
+data$Quality <- ifelse(data$Quality == "bad", 0, 
+                ifelse(data$Quality == "good", 1, 
+                       data$Quality))
+
+# Convert Acidity and Quality (encoded) into numeric
+data$Acidity <- as.numeric(data$Acidity)
+data$Quality <- as.numeric(data$Quality)
+
+# Check for duplicates
+num_duplicates <- sum(duplicated(data))
+cat("\n Number of duplicates:", num_duplicates)
+```
+
+Some ML models are affected by outliers. Therefore, outliers were detected visually using boxplots.
+
+```{r}
+set.seed(1)
+# Plot the data for overview and outlier identification
+data %>%
+  select(-A_id, -Quality) %>%
+  pivot_longer(everything(), names_to="Variable", values_to="Value") %>%
+  ggplot(aes(x = Variable, y = Value)) +
+  geom_boxplot() +
+  ggtitle("Outlier Identification")
+```
+
+With the filter() function, the outliers were separated from the data (IQR \> or \< 1.5) and stored in a dataframe. Because there were only 231 outliers in total, I dropped them completely, as the loss of information is minimal.
+
+```{r}
+set.seed(1)
+# Move outliers into a seperate dataframe
+outliers <- data %>%
+  select(A_id, where(is.numeric)) %>%
+  pivot_longer(-A_id, names_to="Variable", values_to="Value") %>%
+  group_by(Variable) %>%
+  # Filter the outliers using the IQR boundries
+  filter(Value < quantile(Value, 0.25,na.rm=TRUE) - 1.5 
+         * IQR(Value, na.rm=TRUE) | 
+         Value > quantile(Value, 0.75,na.rm=TRUE) + 1.5 
+         * IQR(Value, na.rm=TRUE)) %>% select(A_id, Variable, Value)
+
+# Print total number of outliers
+cat("Number of Outliers:",nrow(outliers))
+
+# Drop all outliers
+data <- data %>% filter(!A_id %in% outliers$A_id)
+
+# Drop A_id column which is not necessary for analysis
+data$A_id <- NULL
+```
+
+## Exploratory Analysis
+
+Get summary statistics of the data.
+
+```{r}
+set.seed(1)
+# Print data summary
+summary(data)
+```
+
+Output the distribution of the target variable.
+
+```{r}
+set.seed(1)
+# Print distribution of target variable
+counts <- table(data$Quality)
+print(counts)
+```
+
+Create histograms of each variable to investigate their distribution.
+
+```{r}
+set.seed(1)
+# Reshape the dataset into a long format to enable plotting
+df_long <- pivot_longer(data, 
+                        cols = everything(), 
+                        names_to = "variable", 
+                        values_to = "value")
+
+# Create histogram
+ggplot(df_long, aes(x=value)) +
+  geom_histogram(bins=30, fill="lightblue", color="black") +
+  facet_wrap(~variable, scales="free") +
+  labs(title="Distribution of Apple Quality Variables",
+       x="Value",
+       y="Frequency")
+```
+
+To see how the variables in the dataset influence each other, a correlation matrix was outputted.
+
+```{r}
+set.seed(1)
+# Compute correlation matrix
+cor_matrix <- cor(data, use = "complete.obs")
+
+# Convert matrix to long format for ggplot
+cor_long <- melt(cor_matrix)
+
+# Plot the correlation matrix
+ggplot(cor_long, aes(x = Var1, y = Var2, fill = value)) + geom_tile() +
+  geom_text(aes(label = round(value, 2)), color = "black", size = 4) +
+  scale_fill_gradient2(low = "red", mid = "white", high = "blue") +
+  labs(title = "Correlation Matrix of Variables") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Train-Validation-Test Split
+
+The dataset was split into training, validation, and test sets with a proportion of approximately 60-20-20.
+
+```{r}
+set.seed(1)
+# Apply Test-Validation-Train split on dataset (n = 3.790)
+# ~ 20% Test set (n = 790)
+train <- sample(1:nrow(data), 3000)
+df_train_ov <- data[train,]
+df_test <- data[-train,]
+
+# 20% Validation set (n = 800)
+val <- sample(1:nrow(df_train_ov), 800)
+df_val <- df_train_ov[val,]
+
+# 60% Train set (n = 2.200)
+df_train <- df_train_ov[-val,]
+```
+
+And directly converted to torch_tensor for later usage.
+
+```{r}
+# Convert predictor and target variables of sets to tensors
+x_train_tensor <- torch_tensor(as.matrix(df_train %>% select(-Quality)),
+                                  dtype=torch_float())
+  
+y_train_tensor <- torch_tensor(as.matrix(df_train$Quality), 
+                               dtype=torch_float())
+
+x_val_tensor <- torch_tensor(as.matrix(df_val %>% select(-Quality)),
+                                  dtype=torch_float())
+  
+y_val_tensor <- torch_tensor(as.matrix(df_val$Quality), 
+                               dtype=torch_float())
+
+x_test_tensor <- torch_tensor(as.matrix(df_test %>% select(-Quality)),
+                              dtype = torch_float())
+
+y_test_tensor <- torch_tensor(as.matrix(df_test$Quality), 
+                              dtype=torch_float())
+```
+
+Additionally, a dataloader was created to handle batch size transitions.
+
+```{r}
+# Define dataloader
+train_ds <- tensor_dataset(x_train_tensor, y_train_tensor)
+train_dl <- dataloader(train_ds, batch_size = 32, shuffle = FALSE)
+
+val_ds <- tensor_dataset(x_val_tensor, y_val_tensor)
+val_dl <- dataloader(val_ds, batch_size = 32, shuffle = FALSE)
+
+test_ds <- tensor_dataset(x_test_tensor, y_test_tensor)
+test_dl <- dataloader(test_ds, batch_size = 32, shuffle = FALSE)
+```
+
+# 
+
+## Task 1 - Deep Feedforward Neural Network
+
+Use Keras/Torch to construct a deep feedforward neural network (excluding convolutional and recurrent layers) with a minimum of three hidden layers to predict either a category (classification) or a continuous value (regression).
+
+Ensure that your neural network:
+
+• Has properly cleaned data (e.g., one-hot encoding, removal of symbols like dollar signs, handling missing values).
+
+• Uses scaled or normalized data (e.g., Z-score standardization) before training.
+
+• Has a suitable architecture and loss function for the problem.
+
+• Reports at least two evaluation metrics for both training and test data.
+
+First, the Deep Neural Network was defined using the torch library. The model consists of fully connected layers with ReLU activation functions, dropout, and a final sigmoid activation for binary classification (only concepts learned in the lecture were used). Second, the network was configured with binary cross-entropy loss, the Adam optimizer (Stochastic Gradient), and the two evaluation metrics accuracy and AUC. Learning Rate and L2-Regularization where configured manually. = More details in report.
+
+```{r}
+set.seed(1)
+# Define Neural Network using torch
+deep_nn <- nn_module(
+  "Deep_Neural_Network",
+  initialize = function() {
+    self$fc1 = nn_linear(7, 128)  # Input to Hidden1
+    self$drop1 = nn_dropout(0.4)  # Dropout 0.4
+    
+    self$fc2 = nn_linear(128, 64)  # Hidden1 to Hidden2
+    self$drop2 = nn_dropout(0.3)
+    
+    self$fc3 = nn_linear(64, 32)  # Hidden2 to Hidden3
+    self$drop3 = nn_dropout(0.2)
+
+    self$fc4 = nn_linear(32, 16)  # Hidden3 to Hidden4
+    self$drop4 = nn_dropout(0.1)
+
+    self$fc5 = nn_linear(16, 1)  # Hidden4 to Output
+  },
+  
+  # Forward pass
+  forward = function(x) {
+    x %>%
+      self$fc1() %>% torch_relu() %>% self$drop1() %>% # Apply ReLU
+      self$fc2() %>% torch_relu() %>% self$drop2() %>%
+      self$fc3() %>% torch_relu() %>% self$drop3() %>%
+      self$fc4() %>% torch_relu() %>% self$drop4() %>%
+      self$fc5() %>% torch_sigmoid() # Sigmoid for binary classification
+  }
+)
+
+# Configure the NN for training
+deep_nn <- deep_nn %>% 
+  setup(
+    loss = nn_bce_loss(), #Binary BCS Loss for binary classification
+    optimizer = optim_adam, #Adam (Stochastic Gradient Descent)
+    metrics = list(
+      luz_metric_binary_accuracy(), # Binary Classification Accuracy
+      luz_metric_binary_auroc() # Binary AUC
+    )
+  ) %>% 
+  # Setting learning rate and L2-Reg manually
+  set_opt_hparams(lr = 0.001, weight_decay = 0.001)
+```
+
+After the configuration, the model needs to be trained. To evaluate the model on different subsets of the data, 10-fold cross-validation is used. First, df_train_ov (excluding df_test but including df_val) is resampled to create 10 folds, where the model is trained on 9 folds and the remaining fold is used as the validation set. Metrics for both the training and validation process are stored and printed afterward. The model is trained for 100 epochs, but training stops early if the early stopping criterion is met. Metrics were manually tuned.
+
+= At the beginning the model was manually tuned (see report)
+
+```{r}
+set.seed(1)
+# Number of folds
+k_folds <- 10
+
+# Create k-fold CV splits using resample
+folds <- rsample::vfold_cv(data.frame(df_train_ov), v = k_folds)
+
+# Initialize vectors for data storage
+val_loss <- numeric(k_folds)
+train_acc <- numeric(k_folds)
+val_acc <- numeric(k_folds)
+train_aucs <- numeric(k_folds)
+val_aucs <- numeric(k_folds)
+
+# Save best model based on AUC
+best_model <- NULL
+best_val_auc <- -Inf # -Inf ensures that any AUC is better
+
+# Loop through each fold
+for (i in seq_along(folds$splits)) {
+  cat("Training Fold", i, "\n")
+  
+  # Get train and val indicies for current fold
+  train_idx <- rsample::analysis(folds$splits[[i]])
+  val_idx <- rsample::assessment(folds$splits[[i]])
+  
+  # Convert predictor and target variables to torch tensors
+  x_train_tensor_fold <- torch_tensor(as.matrix(
+    train_idx %>% select(-Quality)), dtype=torch_float())
+
+  x_val_tensor_fold <- torch_tensor(as.matrix(
+    val_idx %>% select(-Quality)), dtype=torch_float())
+
+  y_train_tensor_fold <- torch_tensor(as.matrix(train_idx$Quality), 
+                                 dtype=torch_float())
+  
+  y_val_tensor_fold <- torch_tensor(as.matrix(val_idx$Quality), 
+                               dtype=torch_float())
+  
+  # Create dataset and dataloader
+  train_ds_cv <- tensor_dataset(x_train_tensor_fold, y_train_tensor_fold)
+  train_dl_cv <- dataloader(train_ds_cv, batch_size = 32, shuffle = TRUE)
+  
+  val_ds_cv <- tensor_dataset(x_val_tensor_fold, y_val_tensor_fold)
+  val_dl_cv <- dataloader(val_ds_cv, batch_size = 32, shuffle = FALSE)
+  
+  # Train the Deep NN
+  fitted <- deep_nn %>%
+    fit(
+      data = train_dl_cv, 
+      epochs = 100, # Train on 100 epochs
+      valid_data = val_dl_cv, # On validation data
+      verbose = FALSE,
+      callbacks = list(
+        luz_callback_early_stopping( # Early Stopping to prevent OF
+          monitor = "valid_loss",
+          min_delta = 0.001, # Minimum required improvement
+          patience = 10 # Stop if no improvement for 10 epochs
+        )
+      )
+    )
+  
+  # Save training and validation metrics
+  df_metrics <- get_metrics(fitted)
+
+  # Extract Loss,Accuracies and AUCs
+  val_loss[[i]] <- df_metrics %>%
+    filter(set == "valid", metric == "loss") %>%
+    tail(1) %>%
+    pull(value) %>% as.numeric()
+
+  train_acc[i] <- df_metrics %>%
+    filter(set == "train", metric == "acc") %>%
+    tail(1) %>%
+    pull(value)
+
+  val_acc[i] <- df_metrics %>%
+    filter(set == "valid", metric == "acc") %>%
+    tail(1) %>%
+    pull(value)
+
+  train_aucs[i] <- df_metrics %>%
+    filter(set == "train", metric == "auc") %>%
+    tail(1) %>%
+    pull(value)
+
+  val_aucs[i] <- df_metrics %>%
+    filter(set == "valid", metric == "auc") %>%
+    tail(1) %>%
+    pull(value)
+    
+  # Update best model selection
+  if (val_aucs[[i]] > best_val_auc) {
+    best_val_auc <- val_aucs[[i]]
+    best_model <- fitted
+  }
+}
+
+# Comppute mean of all model metrics
+cv_mean_loss <- mean(val_loss)
+cv_mean_train_acc <- mean(train_acc)
+cv_mean_train_auc <- mean(train_aucs)
+cv_mean_val_acc <- mean(val_acc)
+cv_mean_val_auc <- mean(val_aucs)
+
+# Print metrics
+print(paste("Mean Validation Loss:", cv_mean_loss))
+print(paste("Mean Training Accuracy:", cv_mean_train_acc))
+print(paste("Mean Training AUC:", cv_mean_train_auc))
+print(paste("Mean Validation Accuracy:", cv_mean_val_acc))
+print(paste("Mean Validation AUC:", cv_mean_val_auc))
+```
+
+The metrics from the best_model (selected based on loss) are stored in a dataframe. Loss, accuracy, and AUC values for the training and validation sets are plotted.
+
+```{r}
+set.seed(1)
+# Save metrics of best model
+df_metrics <- get_metrics(best_model)
+
+# Loss-Plot
+ggplot(df_metrics %>% filter(metric == "loss"), aes(x = epoch, y = value, color = set)) +
+  geom_line(size = 1) +
+  geom_point(size = 1) +
+  labs(title = "Train vs. Validation Loss", y = "Loss", x = "Epoch") +
+  theme_minimal() +
+  scale_color_manual(name = "Set", values = c("train" = "blue", "valid" = "red"))
+
+# Accuracy-Plot
+ggplot(df_metrics %>% filter(metric == "acc"), aes(x = epoch, y = value, color = set)) +
+  geom_line(size = 1) +
+  geom_point(size = 1) +
+  labs(title = "Train vs. Validation Accuracy", y = "Accuracy", x = "Epoch") +
+  theme_minimal() +
+  scale_color_manual(name = "Set", values = c("train" = "blue", "valid" = "red"))
+
+# AUC-Plot
+ggplot(df_metrics %>% filter(metric == "auc"), aes(x = epoch, y = value, color = set)) +
+  geom_line(size = 1) +
+  geom_point(size = 1) +
+  labs(title = "Train vs. Validation AUC", y = "AUC", x = "Epoch") +
+  theme_minimal() +
+  scale_color_manual(name = "Set", values = c("train" = "blue", "valid" = "red"))
+```
+
+The best model is applied on the test data (results are shown in evaluation part).
+
+```{r}
+set.seed(1)
+# Apply best model on test set
+true_test_best <- y_test_tensor %>% as_array() %>% as.numeric()
+pred_test_best <- best_model %>% predict(test_dl) %>% as_array
+```
+
+## Task 2 - K-nearest-neighbor
+
+To determine whether a neural network was necessary, build a simpler statistical learning model from this course and compare the performance. Make sure to use the same predictors and outcome.
+
+Choose one of these models and compare the performance against your neural network to justify and convince me whether deep learning was necessary for the task or not.
+
+For this analysis, df_train_ov was used for tuning, representing the training data with n = 3000. The data has been separated into predictor and target sets, and the target sets has been factorized.
+
+```{r}
+set.seed(1)
+# Create seperate dataset for target and predictor variables
+x_train <- df_train_ov[, -which(names(df_train_ov) == "Quality")]
+y_train <- as.factor(df_train_ov$Quality) # factorize target
+
+x_test <- df_test[, -which(names(df_test) == "Quality")]
+y_test <- as.factor(df_test$Quality)
+```
+
+To determine the best k (from 1 to 20) for the KNN classifier, Leave-One-Out–Cross-Validation (LOOCV) was applied to the training and validation data. In LOOCV, the model is trained on n-1 samples, making it suitable for small datasets. Although the dataset is not small, the code runs efficiently. The k value with the lowest LOOCV error was selected, which is visualized in the plot at k = 10.
+
+```{r}
+set.seed(1)
+
+n <- nrow(x_train) # Get total number of observations
+k_values <- 1:20 # Define range of k values
+loocv_errors <- numeric(length(k_values)) # Empty vector for results
+
+# Loop through each k value to compute LOOCV errors
+for (i in seq_along(k_values)) {
+  k <- k_values[i]
+  errors <- 0 # Initialize error counter
+  
+  # Perform LOOCV
+  for (j in 1:n) {
+    # Define training and validation sets
+    train_X_loocv <- x_train[-j, , drop = FALSE] # excluding j
+    val_X_loocv <- x_train[j, , drop = FALSE] # including j
+    train_Y_loocv <- y_train[-j]
+    val_Y_loocv <- y_train[j]
+    
+    # Apply KNN
+    pred <- knn(train_X_loocv, val_X_loocv, train_Y_loocv, k = k)
+    
+    # Count missclassifications
+    if (pred != val_Y_loocv) {
+      errors <- errors + 1
+    }
+  }
+  # Compute LOOCV error rate
+  loocv_errors[i] <- errors / n
+}
+
+# Select best k (that minimizes LOOCV error)
+best_k <- k_values[which.min(loocv_errors)]
+
+cat("Best k:", best_k, "\n")
+
+# Plot LOOCV errors for different k values
+plot(k_values, 
+     loocv_errors, 
+     type = "b", 
+     xlab = "k", 
+     ylab = "LOOCV-Error",
+     main = "LOOCV for Optimal k")
+```
+
+Fit model with best k on test set.
+
+```{r}
+set.seed(1)
+# Apply best k on test set
+pred_test <- knn(x_train, x_test, y_train, k = best_k)
+```
+
+## Evaluation
+
+First, evaluation metrics for accuracy, precision, recall, and F1-score were defined as functions to reuse them.
+
+```{r}
+set.seed(1)
+# Function to calculate accuracy
+accuracy <- function(true, pred) {
+  acc <- (mean(true == pred))
+  return (round(acc, 4)*100)
+  }
+
+# Function to calculate precision
+precision <- function(conf_matrix) {
+  TP <- conf_matrix[2, 2]  # True Positives
+  FP <- conf_matrix[1, 2]  # False Positives
+  
+  precision <- TP / (TP + FP)
+  return (round(precision, 4)*100)
+}
+
+# Function to calculate recall
+recall <- function(conf_matrix) {
+  TP <- conf_matrix[2, 2]  # True Positives
+  FN <- conf_matrix[2, 1]  # False Negatives  
+  
+  recall <- TP / (TP + FN)
+  return (round(recall, 4)*100)
+}
+
+# Function to calculate F1-score
+f1 <- function(conf_matrix) {
+  prec <- precision(conf_matrix)
+  rec <- recall(conf_matrix)  
+  
+  f1_score <- 2 * (prec * rec) / (prec + rec)
+  return (round(f1_score, 2))
+}
+```
+
+Another function for plotting the ROC-Curve and Calculation AUC was created.
+
+```{r}
+set.seed(1)
+# Function to plot ROC curve and calculates AUC for specific model
+plot_roc_curve <- function(true, pred_prob, model) {
+  # Convert to numeric
+  pred_prob <- as.numeric(as.character(pred_prob))
+  # Compute ROC curve object
+  roc_obj <- roc(true, pred_prob)
+  # Compute AUC (Area under Curve of ROC)
+  auc_value <- auc(roc_obj)
+  
+  # Create df to plot ROC curve
+  roc_df <- data.frame(
+    FPR = 1 - roc_obj$specificities,
+    TPR = roc_obj$sensitivities)
+  
+  # Plot ROC Curve
+  ggplot(roc_df, aes(x = FPR, y = TPR)) +
+    geom_line(color = "blue", size = 1) +
+    geom_abline(linetype = "dashed", color = "gray") +
+    labs(title = paste("ROC Curve -", model),
+         x = "False Positive Rate",
+         y = "True Positive Rate",
+         subtitle = paste("AUC =", round(auc_value, 4))) +
+    theme_minimal()
+}
+```
+
+And another function to visualize a (prettier) confusion matrix.
+
+```{r}
+set.seed(1)
+# Function to compute and plot confusion matrix
+confusion_matrix <- function(true, pred, model) {
+  # Create confusion matrix
+  pred <- as.numeric(as.character(pred))
+  pred_class <- ifelse(pred > 0.5, 1, 0)
+  conf_matrix <- table(true, pred_class)
+  
+  # Convert to df
+  conf_df <- as.data.frame(conf_matrix)
+  colnames(conf_df) <- c("Actual", "Predicted", "Count")
+  
+  # Plot Confusion Matrix
+  ggplot(conf_df, aes(x = Predicted, y = Actual, fill = Count)) +
+    geom_tile() +
+    geom_text(aes(label = Count)) +
+    scale_fill_gradient(low = "lightblue", high = "blue") +
+    labs(title = paste("Confusion Matrix:", model),
+       x = "Predicted", 
+       y = "Actual") + theme_minimal()
+}
+```
+
+Finally, all metrics were summarized in a plot_metrics() function to evaluate a classifier.
+
+```{r}
+set.seed(1)
+# Function to plot all above named metrics at once
+plot_metrics <- function(true, pred, model) {
+  pred <- as.numeric(as.character(pred))
+  pred_class <- ifelse(pred > 0.5, 1, 0)
+  conf_matrix <- table(true, pred_class)
+  
+  if (model == "KNN") {
+    cat("Error Rate: ", 100 - accuracy(true, pred_class), "% \n")
+  }
+  cat("Accuracy: ", accuracy(true, pred_class), "% \n")
+  cat("Precision:", precision(conf_matrix), "% \n")
+  cat("Recall:", recall(conf_matrix), "% \n")
+  cat("F1-Score:", f1(conf_matrix), "% \n")
+}
+```
+
+## Evaluation - Deep NN
+
+In this section the evaluation of the Deep Neural Network happens. First the general parameter information is printed.
+
+```{r}
+set.seed(1)
+# Print architecture of the NN
+print(deep_nn())
+```
+
+Followed by the plot_metrics() function to get Accuracy, Precision, Recall and F1-Score
+
+```{r}
+set.seed(1)
+# Deep NN metrics for test data
+plot_metrics(true_test_best, pred_test_best, "Deep NN")
+```
+
+Plot confusion matrix.
+
+```{r}
+set.seed(1)
+# Plot (prettier) confusion matrix
+confusion_matrix(true_test_best, pred_test_best, "Deep NN")
+```
+
+Plot ROC curve and AUC
+
+```{r}
+set.seed(1)
+# Plot ROC curve and AUC
+plot_roc_curve(true_test_best, pred_test_best, "Deep NN")
+```
+
+To estimate the test set uncertainty of my Deep NN model, I performed bootstrap resampling, as in Assignment 2. To keep the analysis feasible, only the test set was bootstrapped, and predictions were made using the pre-trained model. Bootstrap samples, each the size of the original test set (n = 800), were created with replacement. A total of 500 iterations were performed, and accuracy, precision, and recall were recorded to calculate the 95% confidence interval. As the data set is almost balanced, strativication was not necessary.
+
+```{r}
+set.seed(1)
+iterations <- 1000
+accuracy_nn <- numeric(iterations)
+precision_nn <- numeric(iterations)
+recall_nn <- numeric(iterations)
+
+# Loop for bootstrap iterations
+for (i in 1:iterations) {
+  # Create a bootstrap sample from the test set
+  boot_indices <- sample(1:nrow(x_test), size = 800, replace = TRUE)
+  x_test_boot <- x_test[boot_indices, ]
+  y_test_boot <- y_test[boot_indices]
+
+  # Convert to tensors
+  x_test_tensor_boot <- torch_tensor(as.matrix(x_test_boot), 
+                                     dtype = torch_float())
+  y_test_tensor_boot <- torch_tensor(as.numeric(y_test_boot), 
+                                     dtype = torch_float())
+
+  # Define dataloader
+  test_ds_boot <- tensor_dataset(x_test_tensor_boot, y_test_tensor_boot)
+  test_dl_boot <- dataloader(test_ds_boot, batch_size=32, shuffle=FALSE)
+
+  # Make predictions using pre-trained model
+  pred_boot_test <- best_model %>% predict(test_dl_boot) %>% as_array()
+  pred_boot_test <- as.numeric(pred_boot_test > 0.5)
+
+  # Create confusion matrix
+  conf_matrix <- table(y_test_boot, pred_boot_test)
+
+  # Compute metrics
+  accuracy_nn[i] <- accuracy(y_test_boot, pred_boot_test)
+  recall_nn[i] <- recall(conf_matrix)
+  precision_nn[i] <- precision(conf_matrix)
+}
+
+# Compute 95% confidence intervals
+cat("NN Accuracy CI: ", quantile(accuracy_nn, c(0.025, 0.975)), "\n")
+cat("NN Recall CI: ", quantile(recall_nn, c(0.025, 0.975)), "\n")
+cat("NN Precision CI: ", quantile(precision_nn, c(0.025, 0.975)), "\n")
+```
+
+Combine the metrics in a dataframe to plot them as boxplots and density plots.
+
+```{r}
+set.seed(1)
+# Combine results into a dataframe
+results_nn <- data.frame(
+  Metric = rep(c("Accuracy", "Recall", "Precision"), each = iterations),
+  Value = c(accuracy_nn, recall_nn, precision_nn))
+
+# Boxplot
+ggplot(results_nn, aes(x = Metric, y = Value, fill = Metric)) +
+  geom_boxplot() +
+  labs(title = "Boxplots of NN Bootstrap", 
+       y = "Value") +
+  theme_minimal()
+
+# Density Plot
+ggplot(results_nn, aes(x = Value, fill = Metric)) +
+  geom_density(alpha = 0.6) +
+  facet_wrap(~Metric, scales = "free") +
+  labs(title = "Density Plot of NN Bootstrap", 
+       x = "Value", 
+       y = "Density") +
+  theme_minimal()
+```
+
+## Evaluation - KNN
+
+In this section the evaluation of the KNN happens. First the plot_metrics() function provides Test-Error-Rate, Accuracy, Precision, Recall and F1-Score.
+
+```{r}
+set.seed(1)
+# KNN metrics for test data
+plot_metrics(y_test, pred_test, "KNN")
+```
+
+Plot confusion matrix.
+
+```{r}
+set.seed(1)
+# Plot (prettier) confusion matrix
+confusion_matrix(y_test, pred_test, "KNN")
+```
+
+Plot ROC curve and AUC.
+
+```{r}
+set.seed(1)
+# Plot ROC curve and AUC
+plot_roc_curve(y_test, pred_test, "KNN")
+```
+
+Estimation of test set uncertainty for the KNN model. A total of 500 iterations on a bootstrapped test sample (n = 800) were executed, and the results were saved. Similar to the NN model.
+
+```{r}
+set.seed(1)
+iterations <- 1000
+accuracy_knn <- numeric(iterations)
+recall_knn <- numeric(iterations)
+precision_knn <- numeric(iterations)
+
+# Loop for bootstrap iterations
+for (i in 1:iterations) {
+  boot_indices_test <- sample(1:nrow(x_test), size = 800, replace = TRUE)
+  
+  # Create sets for predictor and target variables
+  x_test_boot <- x_test[boot_indices_test, ]
+  y_test_boot <- as.factor(y_test[boot_indices_test])
+
+  # Predict bootstrapped test set with best model
+  pred_test <- knn(x_train, x_test_boot, y_train, k = best_k)
+  pred_test <- as.numeric(as.character(pred_test))
+  
+  # Create confusion matrix
+  conf_matrix <- table(y_test_boot, pred_test)
+
+  # Compute metrics
+  accuracy_knn[i] <- accuracy(y_test_boot, pred_test)
+  recall_knn[i] <- recall(conf_matrix)
+  precision_knn[i] <- precision(conf_matrix)
+}
+
+# Compute 95% confidence intervals
+cat("KNN Accuracy CI: ", quantile(accuracy_knn, c(0.025, 0.975)), "\n")
+cat("KNN Recall CI: ", quantile(recall_knn, c(0.025, 0.975)), "\n")
+cat("KNN Precision CI: ", quantile(precision_knn, c(0.025, 0.975)), "\n")
+```
+
+Combine the metrics in a dataframe to plot them as boxplots and density plots.
+
+```{r}
+set.seed(1)
+# Combine results into a dataframe
+results <- data.frame(
+  Metric = rep(c("Accuracy", "Recall", "Precision"), each = iterations),
+  Value = c(accuracy_knn, recall_knn, precision_knn))
+
+# Boxplot
+ggplot(results, aes(x = Metric, y = Value, fill = Metric)) +
+  geom_boxplot() +
+  labs(title = "Bootstrap Distributions of KNN Metrics", 
+       y = "Value") +
+  theme_minimal()
+
+# Density Plot
+ggplot(results, aes(x = Value, fill = Metric)) +
+  geom_density(alpha = 0.6) +
+  facet_wrap(~Metric, scales = "free") +
+  labs(title = "Density Plot of Bootstrap Distributions", 
+       x = "Value", 
+       y = "Density") +
+  theme_minimal()
+```
